@@ -553,8 +553,11 @@ function handleClaudeMessage(run, msg) {
     run.costUsd = (run.costUsd || 0) + (msg.total_cost_usd || 0);
     if (msg.structured_output && typeof msg.structured_output === "object") {
       const kind = run.phase === "plan" ? "plan" : "review";
+      // A request typed without a heading is named by the first plan, not by its cut-off first line.
+      const named = msg.structured_output.title?.trim();
+      if (kind === "plan" && !run.plan && named && !/^#+\s*\S/m.test(run.spec)) run.title = named.slice(0, 64);
       run[kind] = msg.structured_output;
-      emit(run, { type: "review", kind, review: msg.structured_output });
+      emit(run, { type: "review", kind, review: msg.structured_output, title: run.title });
     }
     emit(run, {
       type: "result",

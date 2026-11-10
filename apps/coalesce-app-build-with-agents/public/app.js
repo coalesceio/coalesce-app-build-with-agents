@@ -1391,6 +1391,8 @@ async function decide(kind, btn, body) {
     await api("POST", `api/runs/${S.run.id}/${kind}`, body);
     S.file = null;
     S.conflicts = null;
+    // Adding or removing nodes changes the workspace's node count in the rail.
+    if (kind === "keep" || kind === "undo") api("GET", "api/status").then((s) => { S.status = s; renderRail(); }).catch(() => {});
   } catch (error) {
     if (error.status === 409 && error.data?.conflicts) {
       S.conflicts = error.data.conflicts;
@@ -1500,6 +1502,7 @@ function scheduleRender() {
 function applyEvent(e) {
   const run = S.run;
   if (e.type === "todos") run.todos = e.todos;
+  if (e.type === "review" && e.title) run.title = e.title;
   if (e.type === "changes") {
     const before = new Map((run.changes || []).map((c) => [c.path, `${c.added}/${c.removed}`]));
     S.fresh = new Set(e.changes.filter((c) => before.get(c.path) !== `${c.added}/${c.removed}`).map((c) => c.path));
