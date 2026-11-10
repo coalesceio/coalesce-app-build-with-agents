@@ -4,6 +4,8 @@ All notable changes to the Build with Agents app. Format follows [Keep a Changel
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-10
+
 ### Fixed
 - **Thread names for requests typed without a title.** The thread is named by the agent's plan, like "Members by state and plan", instead of the first line of the request cut off at 64 characters.
 - **The workspace's node count** in the sidebar now updates when you apply a thread or remove it again.
