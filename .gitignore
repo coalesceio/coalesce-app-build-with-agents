@@ -1,0 +1,3 @@
+.DS_Store
+# Local demo material, not part of the app.
+/demo-spec*.md
