@@ -4,6 +4,8 @@ All notable changes to the Build with Agents app. Format follows [Keep a Changel
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-10
+
 First release.
 
 ### Added
@@ -13,3 +15,4 @@ First release.
 - **Review and apply.** See each file the agent wrote, then apply the changes to your workspace, uncommitted. Remove them again until they're committed.
 - **Threads** for every request, grouped by stage (Plans, Builds, Applied) with what's waiting on you. Stop, discard or delete a thread at any time.
 - **Settings** for the model, effort, turn and budget limits, and compaction, plus a setup page that checks Claude Code, the workspace's sources and its storage locations.
+
