@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Vendor Coalesce Platform Skills into the app at a pinned release.
-# The app loads them with `claude --plugin-dir`, so they ship and update with the app.
+# The app loads them with `--plugin-dir` (Claude Code and Cortex Code take the same flag), so they ship and update with the app.
 # Only skills that work without a shell and stay inside nodes/ are kept.
 # Usage: scripts/update-skills.sh <tag>   (for example 0.1.13)
 set -euo pipefail
