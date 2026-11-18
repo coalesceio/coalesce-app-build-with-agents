@@ -6,6 +6,8 @@
 // `base`, untouched, and `work`, where the user's own Claude Code writes. Keep applies the
 // base→work changes to the real workspace, refusing files that changed there since; Discard
 // deletes both copies. Several sessions can run at once.
+//
+// The agent is the person's own Claude Code or Cortex Code (AGENTS below), run headless once per turn.
 "use strict";
 
 const http = require("http");
@@ -29,31 +31,75 @@ const STATE_DIR = path.join(
   crypto.createHash("sha1").update(WORKSPACE).digest("hex").slice(0, 12)
 );
 const RUNS_DIR = path.join(STATE_DIR, "runs");
-// The person's choices on the Settings and Claude Code pages; shared by every workspace.
+// The person's choices on the Settings and agent pages; shared by every workspace.
 const SETTINGS_FILE = path.join(path.dirname(STATE_DIR), "settings.json");
-// The model the last session ran on when the app's Model setting was left on Default.
-const DEFAULT_MODEL_FILE = path.join(path.dirname(STATE_DIR), "default-model");
-let defaultModel = "";
-try {
-  defaultModel = fs.readFileSync(DEFAULT_MODEL_FILE, "utf8").trim();
-} catch {
-  // Not seen yet.
+
+// The coding agents the app can drive. Cortex Code prints the same stream-json as Claude Code and
+// loads the same plugin format, so only finding it, its flags and its tool names differ.
+const AGENTS = {
+  claude: {
+    id: "claude",
+    name: "Claude Code",
+    exe: "claude",
+    override: "CLAUDE_PATH",
+    authLabel: "Claude Code is signed in",
+    authFix: "Run `claude` once in a terminal and sign in.",
+  },
+  cortex: {
+    id: "cortex",
+    name: "Cortex Code",
+    exe: "cortex",
+    override: "CORTEX_PATH",
+    authLabel: "Cortex Code has a Snowflake connection",
+    authFix: "Run `cortex` once in a terminal and set up a connection.",
+  },
+};
+// Threads started before there was a choice ran on Claude Code.
+const agentOf = (run) => run.agent || "claude";
+
+// The model each agent's last session ran on when the app's Model setting left the choice to it.
+const defaultModelFile = (id) => path.join(path.dirname(STATE_DIR), id === "claude" ? "default-model" : `default-model-${id}`);
+const defaultModels = {};
+for (const id of Object.keys(AGENTS)) {
+  try {
+    defaultModels[id] = fs.readFileSync(defaultModelFile(id), "utf8").trim();
+  } catch {
+    // Not seen yet.
+  }
 }
 
 // Top-level workspace entries the copies and the change list ignore.
-const SKIPPED = new Set(["apps", ".git", ".coa", ".claude", "node_modules", ".DS_Store"]);
+const SKIPPED = new Set(["apps", ".git", ".coa", ".claude", ".cortex", "node_modules", ".DS_Store"]);
 const TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "ToolSearch", "Skill"];
 // A thread opens with a plan the person approves before anything is written, so planning turns
 // get only the tools that read.
 const PLAN_TOOLS = ["Read", "Glob", "Grep", "ToolSearch", "Skill"];
+// Cortex Code's names for the same tools. Events use Claude Code's names for both agents.
+const TOOL_ALIASES = { read: "Read", write: "Write", edit: "Edit", glob: "Glob", grep: "Grep", system_todo_write: "TodoWrite", tool_search: "ToolSearch", skill: "Skill" };
+// Plumbing the person doesn't need a line for. Cortex Code's direct_tool_calling batches other
+// calls, and each of those still arrives, and is permission-checked, as a call of its own.
+const QUIET_TOOLS = new Set(["ToolSearch", "StructuredOutput", "direct_tool_calling"]);
+const cortexNames = (tools) => Object.keys(TOOL_ALIASES).filter((name) => tools.includes(TOOL_ALIASES[name]));
+// Headless Cortex Code refuses every tool that isn't allowed, so the allowed list is the boundary.
+// These are also taken out of the model's sight so it doesn't spend steps trying them.
+const CORTEX_HIDDEN = ["bash", "bash_output", "kill_shell", "sql_execute", "web_fetch", "web_search", "notebook_actions", "data_diff", "fdbt", "task", "ask_user_question", "enter_plan_mode", "exit_plan_mode", "monitor", "cron_create"];
+// The guide reaches Cortex Code as a custom agent definition with this name.
+const CORTEX_AGENT = "build-with-agents";
+// Cortex Code takes the prompt as an argument, and a long spec doesn't fit on every platform's
+// command line (Windows allows about 32k characters in all).
+const MAX_ARG_PROMPT = 20_000;
 // Coalesce Platform Skills, vendored at a pinned release (scripts/update-skills.sh) and loaded as a
 // plugin, so they ship and update with the app and work offline.
 const SKILLS_DIR = path.join(__dirname, "vendor", "coalesce-platform-skills");
 // Opus at medium effort whatever the person's own Claude Code defaults to, so a thread costs the
 // same for everyone and a personal switch to a larger model doesn't carry over unnoticed.
-const DEFAULT_SETTINGS = { model: "opus", effort: "medium", compact: "500k", budgetUsd: 0, maxTurns: 80 };
+// With no agent chosen the app uses whichever is installed (activeAgent). Cortex Code's own default
+// model is "auto": Snowflake picks the best one the account can use.
+const DEFAULT_SETTINGS = { agent: "", model: "opus", cortexModel: "", effort: "medium", compact: "500k", budgetUsd: 0, maxTurns: 80 };
 const SETTING_CHOICES = {
+  agent: ["", "claude", "cortex"],
   model: ["", "fable", "opus", "sonnet"],
+  cortexModel: ["", "claude-opus-5-5", "claude-sonnet-5-5"],
   effort: ["", "low", "medium", "high", "xhigh", "max"],
   compact: ["500k", "200k", "off"],
   budgetUsd: [0, 2, 5, 10],
@@ -121,7 +167,7 @@ async function readText(file) {
   }
 }
 
-// ───────────── Claude Code ─────────────
+// ───────────── agents ─────────────
 
 // An app launched from the Dock doesn't inherit the shell's PATH, so ask a login shell for it and
 // add the usual install locations. The login shell is slow, so ask once and again only on a recheck.
@@ -157,23 +203,31 @@ async function providerEnv() {
   }
 }
 
-let claudePromise;
-function findClaude(force = false) {
-  if (!claudePromise || force) claudePromise = locateClaude(force);
-  return claudePromise;
+const agentPromises = {};
+function findAgent(id, force = false) {
+  if (!agentPromises[id] || force) agentPromises[id] = locateAgent(AGENTS[id]);
+  return agentPromises[id];
 }
 
-async function locateClaude(force) {
-  const PATH = await resolvePath(force);
-  const env = { ...process.env, ...(await providerEnv()), PATH, COALESCE_APP: "build-with-agents" };
+// The agent new threads use: the person's choice, or else whichever is installed, Claude Code first.
+// A thread stays on the agent it started with, since its conversation lives in that agent's sessions.
+async function activeAgent(force = false) {
+  const [settings, claude, cortex] = await Promise.all([readSettings(), findAgent("claude", force), findAgent("cortex", force)]);
+  const id = settings.agent || (!claude.found && cortex.found ? "cortex" : "claude");
+  return id === "cortex" ? cortex : claude;
+}
+
+async function locateAgent(agent) {
+  const PATH = await resolvePath();
+  const env = { ...process.env, ...(agent.id === "claude" ? await providerEnv() : {}), PATH, COALESCE_APP: "build-with-agents" };
   delete env.ELECTRON_RUN_AS_NODE;
   // If Coalesce was started from inside a Claude Code session, that session's variables (its id,
   // plugin dirs, messaging socket) would leak into ours. Keep only the ones that choose a provider.
   delete env.CLAUDECODE;
   for (const k of Object.keys(env)) if (/^CLAUDE_CODE_/.test(k) && !PROVIDER_ENV.test(k) && k !== "CLAUDE_CODE_OAUTH_TOKEN") delete env[k];
-  const exe = process.platform === "win32" ? "claude.exe" : "claude";
-  const candidates = process.env.CLAUDE_PATH
-    ? [process.env.CLAUDE_PATH]
+  const exe = process.platform === "win32" ? `${agent.exe}.exe` : agent.exe;
+  const candidates = process.env[agent.override]
+    ? [process.env[agent.override]]
     : PATH.split(path.delimiter).map((dir) => path.join(dir, exe));
   for (const candidate of candidates) {
     try {
@@ -183,20 +237,38 @@ async function locateClaude(force) {
     }
     const [r, auth] = await Promise.all([
       exec(candidate, ["--version"], { env, timeout: 20_000 }),
-      exec(candidate, ["auth", "status"], { env, timeout: 20_000 }),
+      exec(candidate, agent.id === "cortex" ? ["connections", "list"] : ["auth", "status"], { env, timeout: 20_000 }),
     ]);
     if (r.code !== 0) continue;
-    const version = r.stdout.trim().split(/\s/)[0];
-    let account = null;
-    try {
-      account = JSON.parse(auth.stdout);
-    } catch {
-      // Older versions print text; treat a zero exit as signed in.
-      account = auth.code === 0 ? { loggedIn: true } : { loggedIn: false };
-    }
-    return { found: true, path: candidate, version, env, account };
+    // "2.1.5 (Claude Code)" and "Cortex Code v1.2.46".
+    const version = (r.stdout.match(/\d+(?:\.\d+)+/) || [r.stdout.trim()])[0];
+    const account = agent.id === "cortex" ? cortexAccount(auth) : claudeAccount(auth);
+    return { ...agent, found: true, path: candidate, version, env, account };
   }
-  return { found: false, env };
+  return { ...agent, found: false, env };
+}
+
+function claudeAccount(auth) {
+  try {
+    return JSON.parse(auth.stdout);
+  } catch {
+    // Older versions print text; treat a zero exit as signed in.
+    return { loggedIn: auth.code === 0 };
+  }
+}
+
+// Cortex Code signs in through a Snowflake connection. Having an active one is as far as the app
+// checks: trying it could open a browser for single sign-on. A connection that doesn't work shows
+// up as an error in the thread.
+function cortexAccount(list) {
+  try {
+    const { active_connection: name, connections = {} } = JSON.parse(list.stdout);
+    const connection = connections[name];
+    if (!connection) return { loggedIn: false };
+    return { loggedIn: true, connection: name, snowflakeAccount: connection.account, user: connection.user };
+  } catch {
+    return { loggedIn: false };
+  }
 }
 
 // A claude.ai login on Anthropic's own API bills against a plan (Pro, Max, Team, Enterprise), so
@@ -231,7 +303,7 @@ async function skillsInfo() {
 let connectorsCache = null;
 async function listConnectors(force) {
   if (connectorsCache && !force && Date.now() - connectorsCache.at < 5 * 60_000) return connectorsCache.value;
-  const claude = await findClaude();
+  const claude = await findAgent("claude");
   if (!claude.found) return { items: [], error: "Claude Code isn't installed." };
   const r = await exec(claude.path, ["mcp", "list"], { env: claude.env, timeout: 90_000 });
   const items = [];
@@ -376,6 +448,8 @@ const runDir = (id) => path.join(RUNS_DIR, id);
 const baseDir = (id) => path.join(runDir(id), "base");
 const workDir = (id) => path.join(runDir(id), "work");
 const beforeDir = (id) => path.join(runDir(id), "before-add");
+// Where a turn's prompt goes when it's too long to pass to Cortex Code as an argument.
+const promptFile = (id) => path.join(runDir(id), "prompt.md");
 
 function plain(text) {
   return text.replace(/\*\*|`|^#+\s*|^>\s*/gm, "").replace(/\s+/g, " ").trim();
@@ -412,7 +486,7 @@ function summarize(run) {
 }
 
 function publicRun(run) {
-  const { events, child, clients, refreshTimer, sawResult, stderrTail, pendingTools, stopping, baseIssues, disposed, ...rest } = run;
+  const { events, child, clients, refreshTimer, sawResult, stderrTail, pendingTools, stopping, baseIssues, disposed, turnStarted, ...rest } = run;
   return { ...rest, running: Boolean(child), summary: summarize(run) };
 }
 
@@ -504,32 +578,54 @@ function describeTool(run, name, input = {}) {
   }
 }
 
-function handleClaudeMessage(run, msg) {
+// Records the model a turn ran on. With no model chosen in the app, it's also the one the person's
+// agent defaults to, which the Model setting shows.
+function noteModel(run, model) {
+  // Cortex Code starts on "auto" and names the model it picked when the turn ends.
+  if (!model || model === "auto") return;
+  run.model = model;
+  const id = agentOf(run);
+  if (run.usedDefaultModel && model !== defaultModels[id]) {
+    defaultModels[id] = model;
+    fsp.writeFile(defaultModelFile(id), model).catch(() => {});
+  }
+}
+
+function isJsonObject(text) {
+  if (!/^\s*\{[\s\S]*\}\s*$/.test(text)) return false;
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function handleAgentMessage(run, msg) {
   if (msg.type === "system" && msg.subtype === "init") {
-    run.model = msg.model;
-    // Counted once Claude Code has started the session, so a turn that fails before that (bad
+    noteModel(run, msg.model);
+    // Counted once the agent has started the session, so a turn that fails before that (bad
     // model, missing auth) doesn't make the next one --resume a session that doesn't exist.
     run.turnCount = (run.turnCount || 0) + 1;
-    // With no model chosen in the app, this is the model the person's Claude Code defaults to.
-    if (run.usedDefaultModel && msg.model !== defaultModel) {
-      defaultModel = msg.model;
-      fsp.writeFile(DEFAULT_MODEL_FILE, msg.model).catch(() => {});
-    }
     saveRun(run);
     return;
   }
   if (msg.type === "assistant" && msg.message && Array.isArray(msg.message.content)) {
     for (const block of msg.message.content) {
       if (block.type === "text" && block.text.trim()) {
-        emit(run, { type: "text", text: block.text });
+        // Cortex Code also sends the structured output as a message; the card shows that.
+        if (!isJsonObject(block.text)) emit(run, { type: "text", text: block.text });
       } else if (block.type === "tool_use") {
-        if (block.name === "TodoWrite") {
+        const name = TOOL_ALIASES[block.name] || block.name;
+        if (name === "TodoWrite") {
           run.todos = (block.input.todos || []).map((t) => ({ content: t.content, status: t.status, activeForm: t.activeForm }));
           emit(run, { type: "todos", todos: run.todos });
-        } else if (block.name !== "ToolSearch" && block.name !== "StructuredOutput") {
-          const d = describeTool(run, block.name, block.input);
+        } else if (name === "Read" && block.input?.file_path === promptFile(run.id)) {
+          // The agent picking up its own instructions isn't progress worth a line.
+        } else if (!QUIET_TOOLS.has(name)) {
+          const d = describeTool(run, name, block.input);
           run.pendingTools.set(block.id, d);
-          emit(run, { type: "tool", id: block.id, tool: block.name, ...d });
+          emit(run, { type: "tool", id: block.id, tool: name, ...d });
         }
       }
     }
@@ -550,6 +646,8 @@ function handleClaudeMessage(run, msg) {
   }
   if (msg.type === "result") {
     run.sawResult = true;
+    if (agentOf(run) === "cortex") noteModel(run, Object.keys(msg.modelUsage || {})[0]);
+    // Cortex Code reports no cost: its usage is billed as Snowflake credits.
     run.costUsd = (run.costUsd || 0) + (msg.total_cost_usd || 0);
     if (msg.structured_output && typeof msg.structured_output === "object") {
       const kind = run.phase === "plan" ? "plan" : "review";
@@ -559,14 +657,17 @@ function handleClaudeMessage(run, msg) {
       run[kind] = msg.structured_output;
       emit(run, { type: "review", kind, review: msg.structured_output, title: run.title });
     }
+    // Ending on structured output, Cortex Code counts only its last round, so its turn is timed
+    // here and its step count left out.
+    const cortex = agentOf(run) === "cortex";
     emit(run, {
       type: "result",
       ok: !msg.is_error,
       subtype: msg.subtype,
       costUsd: msg.total_cost_usd,
-      turns: msg.num_turns,
-      durationMs: msg.duration_ms,
-      text: msg.is_error ? msg.result : undefined,
+      turns: cortex ? undefined : msg.num_turns,
+      durationMs: cortex ? Date.now() - run.turnStarted : msg.duration_ms,
+      text: msg.is_error ? msg.result || (msg.errors || []).join(" ") : undefined,
     });
   }
 }
@@ -574,48 +675,27 @@ function handleClaudeMessage(run, msg) {
 // phase and fixing are written to the run only once the agent starts, so a turn that fails to start
 // leaves the thread as it was.
 async function startTurn(run, prompt, { phase = run.phase, fixing = false } = {}) {
-  const claude = await findClaude();
-  if (!claude.found) throw httpError(424, "Claude Code isn't installed or couldn't be found.");
+  const agent = await findAgent(agentOf(run));
+  if (!agent.found) throw httpError(424, `${agent.name} isn't installed or couldn't be found.`);
   const settings = await readSettings();
   const planning = phase === "plan";
-  const tools = (planning ? PLAN_TOOLS : TOOLS).join(",");
-  const args = [
-    "-p",
-    "--output-format", "stream-json",
-    "--verbose",
-    "--setting-sources", "",
-    "--settings", await claudeSettingsJson(settings),
-    "--strict-mcp-config",
-    "--plugin-dir", SKILLS_DIR,
-    "--permission-mode", "acceptEdits",
-    "--max-turns", String(settings.maxTurns),
-    "--append-system-prompt", GUIDE,
-    "--json-schema", planning ? PLAN_SCHEMA : REVIEW_SCHEMA,
-    "--tools", tools,
-    "--allowedTools", tools,
-  ];
-  // The first turn fixes the session id, so the session is ours to find from the start; later turns
-  // resume it. The name tags it in `claude --resume` pickers, and the working directory (under
-  // ~/.coa/apps/build-with-agents) groups every app session in one Claude Code project.
-  if (settings.model) args.push("--model", settings.model);
-  if (settings.effort) args.push("--effort", settings.effort);
-  if (settings.budgetUsd && billsByUsage(claude.account)) args.push("--max-budget-usd", String(settings.budgetUsd));
-  if (run.turnCount) args.push("--resume", run.sessionId);
-  else args.push("--session-id", run.sessionId, "--name", `${APP_NAME}: ${run.title}`);
+  const cortex = agent.id === "cortex";
+  const args = cortex ? await cortexArgs(run, prompt, settings, planning) : await claudeArgs(run, settings, planning, agent);
 
-  run.usedDefaultModel = !settings.model;
+  run.usedDefaultModel = !(cortex ? settings.cortexModel : settings.model);
   run.pendingTools = new Map();
   run.sawResult = false;
   run.stopping = false;
   run.stderrTail = "";
-  const child = spawn(claude.path, args, { cwd: workDir(run.id), env: claude.env, stdio: ["pipe", "pipe", "pipe"] });
+  run.turnStarted = Date.now();
+  const child = spawn(agent.path, args, { cwd: workDir(run.id), env: agent.env, stdio: ["pipe", "pipe", "pipe"] });
   run.child = child;
   run.phase = phase;
   run.fixing = fixing;
   // Every listener goes on before the first await: an unhandled 'error' (spawn ENOENT, or EPIPE when
-  // Claude exits before reading the prompt) would crash the server.
+  // the agent exits before reading the prompt) would crash the server.
   child.stdin.on("error", () => {});
-  child.stdin.end(prompt);
+  child.stdin.end(cortex ? "" : prompt);
 
   let buffer = "";
   child.stdout.on("data", (chunk) => {
@@ -625,11 +705,16 @@ async function startTurn(run, prompt, { phase = run.phase, fixing = false } = {}
       const line = buffer.slice(0, nl).trim();
       buffer = buffer.slice(nl + 1);
       if (!line) continue;
+      let msg;
       try {
-        handleClaudeMessage(run, JSON.parse(line));
+        msg = JSON.parse(line);
       } catch {
-        // Not JSON; ignore.
+        // Not a message. Cortex Code prints some failures here as plain text (an unsupported
+        // version, say), so keep it for the error the thread shows.
+        run.stderrTail = (run.stderrTail + line + "\n").slice(-2000);
+        continue;
       }
+      handleAgentMessage(run, msg);
     }
   });
   child.stderr.on("data", (chunk) => {
@@ -642,7 +727,7 @@ async function startTurn(run, prompt, { phase = run.phase, fixing = false } = {}
       emit(run, { type: "notice", text: planning ? "Stopped. Reply to have the agent plan again." : "Stopped. What the agent wrote so far is kept in this thread for you to review." });
     } else if (!run.sawResult) {
       const detail = run.stderrTail.trim().split("\n").slice(-3).join(" ");
-      emit(run, { type: "error", text: `Claude Code exited (code ${code}) before finishing.${detail ? " " + detail : ""}` });
+      emit(run, { type: "error", text: `${agent.name} exited (code ${code}) before finishing.${detail ? " " + detail : ""}` });
     }
     const finished = run.sawResult && !run.stopping;
     run.stopping = false;
@@ -652,7 +737,7 @@ async function startTurn(run, prompt, { phase = run.phase, fixing = false } = {}
       return;
     }
     scheduleChangeRefresh(run, 0);
-    // Check the nodes with Coalesce's own validator. Problems go back to Claude once per reply;
+    // Check the nodes with Coalesce's own validator. Problems go back to the agent once per reply;
     // if they survive that, the person sees them next to the review.
     const check = finished ? await validateRun(run).catch(() => null) : null;
     // Stop pressed while the validator ran: report what it found, but don't start a fix round.
@@ -678,6 +763,72 @@ async function startTurn(run, prompt, { phase = run.phase, fixing = false } = {}
     finish(-1);
   });
   await setStatus(run, "running");
+}
+
+async function claudeArgs(run, settings, planning, claude) {
+  const tools = (planning ? PLAN_TOOLS : TOOLS).join(",");
+  const args = [
+    "-p",
+    "--output-format", "stream-json",
+    "--verbose",
+    "--setting-sources", "",
+    "--settings", await claudeSettingsJson(settings),
+    "--strict-mcp-config",
+    "--plugin-dir", SKILLS_DIR,
+    "--permission-mode", "acceptEdits",
+    "--max-turns", String(settings.maxTurns),
+    "--append-system-prompt", GUIDE,
+    "--json-schema", planning ? PLAN_SCHEMA : REVIEW_SCHEMA,
+    "--tools", tools,
+    "--allowedTools", tools,
+  ];
+  // The first turn fixes the session id, so the session is ours to find from the start; later turns
+  // resume it. The name tags it in `claude --resume` pickers, and the working directory (under
+  // ~/.coa/apps/build-with-agents) groups every app session in one Claude Code project.
+  if (settings.model) args.push("--model", settings.model);
+  if (settings.effort) args.push("--effort", settings.effort);
+  if (settings.budgetUsd && billsByUsage(claude.account)) args.push("--max-budget-usd", String(settings.budgetUsd));
+  if (run.turnCount) args.push("--resume", run.sessionId);
+  else args.push("--session-id", run.sessionId, "--name", `${APP_NAME}: ${run.title}`);
+  return args;
+}
+
+// Cortex Code takes the same schema, plugin and session flags as Claude Code. What differs: the
+// prompt is an argument, the guide arrives as a custom agent definition (there is no flag for extra
+// system instructions), and the person's own skills, plugins and MCP servers are each switched off
+// by a flag of their own.
+async function cortexArgs(run, prompt, settings, planning) {
+  // Written every turn so a thread picks up the guide of the app version it resumes on. It lives
+  // in the thread's copy, under a folder the change list ignores.
+  const definition = path.join(workDir(run.id), ".cortex", "agents", `${CORTEX_AGENT}.md`);
+  await fsp.mkdir(path.dirname(definition), { recursive: true });
+  await fsp.writeFile(definition, `---\nname: ${CORTEX_AGENT}\ndescription: "The agent behind ${APP_NAME}."\n---\n\n${GUIDE}`);
+  if (prompt.length > MAX_ARG_PROMPT) {
+    await fsp.writeFile(promptFile(run.id), prompt);
+    prompt = `Your instructions for this turn are in ${promptFile(run.id)}. Read that file now and follow it.`;
+  }
+  const allowed = cortexNames(planning ? PLAN_TOOLS : TOOLS);
+  const hidden = [...CORTEX_HIDDEN, ...cortexNames(TOOLS).filter((name) => !allowed.includes(name))];
+  const args = [
+    // One argument with "=", so a prompt that starts with a dash isn't read as a flag.
+    `--print=${prompt}`,
+    "--output-format", "stream-json",
+    "--setting-sources", "",
+    "--no-mcp",
+    "--only-explicit-skills",
+    "--only-explicit-plugins",
+    "--plugin-dir", SKILLS_DIR,
+    "--agent", CORTEX_AGENT,
+    "--max-turns", String(settings.maxTurns),
+    "--json-schema", planning ? PLAN_SCHEMA : REVIEW_SCHEMA,
+    "--allowed-tools", allowed.join(","),
+    "--disallowed-tools", hidden.join(","),
+  ];
+  if (settings.cortexModel) args.push("--model", settings.cortexModel);
+  if (settings.effort) args.push("--effort", settings.effort);
+  if (run.turnCount) args.push("--resume", run.sessionId);
+  else args.push("--session-id", run.sessionId, "--session-name", `${APP_NAME}: ${run.title}`);
+  return args;
 }
 
 // ───────────── validation ─────────────
@@ -739,6 +890,7 @@ async function createRun(spec) {
   const id = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14) + "-" + crypto.randomBytes(3).toString("hex");
   const run = {
     id,
+    agent: (await activeAgent()).id,
     title: titleFromSpec(spec),
     spec,
     status: "running",
@@ -963,22 +1115,23 @@ async function loadRuns() {
 
 // ───────────── setup checks ─────────────
 
-function setupChecks(claude, ws) {
-  const signedIn = claude.found && claude.account && claude.account.loggedIn;
-  const via = claude.account && (claude.account.email || claude.account.authMethod || claude.account.apiProvider);
+function setupChecks(agent, ws) {
+  const account = agent.account || {};
+  const signedIn = agent.found && account.loggedIn;
+  const via = account.connection ? `${account.user} on ${account.snowflakeAccount}` : account.email || account.authMethod || account.apiProvider;
   return [
     {
-      id: "claude",
-      label: "Claude Code is installed",
-      ok: claude.found,
-      detail: claude.found ? `Version ${claude.version}` : "Install it, then check again.",
-      help: claude.found ? "" : "install",
+      id: "agent",
+      label: `${agent.name} is installed`,
+      ok: agent.found,
+      detail: agent.found ? `Version ${agent.version}` : "Install it, then check again.",
+      help: agent.found ? "" : "install",
     },
     {
       id: "auth",
-      label: "Claude Code is signed in",
+      label: agent.authLabel,
       ok: Boolean(signedIn),
-      detail: signedIn ? (via ? `As ${via}` : "Signed in") : claude.found ? "Run `claude` once in a terminal and sign in." : "Needs Claude Code first.",
+      detail: signedIn ? (via ? `As ${via}` : "Signed in") : agent.found ? agent.authFix : `Needs ${agent.name} first.`,
       help: signedIn ? "" : "login",
     },
     {
@@ -1077,28 +1230,32 @@ async function route(req, res) {
   if (m && !run) throw httpError(404, "No such session.");
 
   if (p === "/api/status" && req.method === "GET") {
-    const [claude, ws] = await Promise.all([findClaude(url.searchParams.has("recheck")), workspaceSummary()]);
-    const checks = setupChecks(claude, ws);
+    const recheck = url.searchParams.has("recheck");
+    if (recheck) resolvePath(true);
+    const [agent, ws] = await Promise.all([activeAgent(recheck), workspaceSummary()]);
+    const [claude, cortex] = await Promise.all([findAgent("claude"), findAgent("cortex")]);
+    const checks = setupChecks(agent, ws);
+    const a = agent.account;
     return sendJson(res, 200, {
       dev: DEV,
       ready: checks.every((c) => c.ok || c.optional),
       checks,
-      claude: {
-        found: claude.found,
-        version: claude.version,
-        signedIn: Boolean(claude.account && claude.account.loggedIn),
-        billing: billsByUsage(claude.account) ? "usage" : "plan",
-        account: claude.account
-          ? {
-              email: claude.account.email,
-              plan: claude.account.subscriptionType,
-              method: claude.account.authMethod,
-              provider: claude.account.apiProvider,
-              org: claude.account.orgName,
-            }
-          : null,
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        found: agent.found,
+        version: agent.version,
+        signedIn: Boolean(a && a.loggedIn),
+        account: !a
+          ? null
+          : agent.id === "cortex"
+            ? { connection: a.connection, snowflakeAccount: a.snowflakeAccount, user: a.user }
+            : { email: a.email, plan: a.subscriptionType, method: a.authMethod, provider: a.apiProvider, org: a.orgName },
       },
-      defaultModel,
+      agents: [claude, cortex].map((x) => ({ id: x.id, name: x.name, found: x.found })),
+      // Only Claude Code reports dollar costs, so this is about its account whichever agent is in use.
+      billing: billsByUsage(claude.account) ? "usage" : "plan",
+      defaultModel: defaultModels[agent.id] || "",
       storage: STATE_DIR,
       workspace: ws,
     });
@@ -1184,7 +1341,7 @@ function watchForDev() {
       if (restart) {
         if ([...runs.values()].some((r) => r.child)) {
           // Don't kill a session mid-build; pick the change up on the next edit.
-          console.log("server files changed; not restarting while Claude is working");
+          console.log("server files changed; not restarting while an agent is working");
           restart = false;
           return;
         }
@@ -1214,6 +1371,6 @@ loadRuns().then(() => {
   const v6 = http.createServer(server.listeners("request")[0]);
   v6.on("error", () => {});
   v6.listen(PORT, "::1");
-  findClaude();
+  activeAgent();
   if (DEV) watchForDev();
 });

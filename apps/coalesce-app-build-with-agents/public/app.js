@@ -2,9 +2,9 @@
 
 // ───────────── state ─────────────
 const S = {
-  view: "home",        // home | builder | plans | builds | applied | session | setup | settings | claude
-  status: null,        // { ready, checks, claude, workspace }
-  settings: null,      // the person's app and Claude Code choices
+  view: "home",        // home | builder | plans | builds | applied | session | setup | settings | agent
+  status: null,        // { ready, checks, agent, agents, workspace }
+  settings: null,      // the person's app and agent choices
   skills: undefined,   // the Coalesce skills sessions load (undefined until fetched)
   connectors: undefined, // the person's MCP servers and connectors (undefined until fetched)
   runs: [],
@@ -157,8 +157,10 @@ function ago(iso) {
 const mdLine = (src) => md(src).replace(/^<p>|<\/p>$/g, "");
 
 // Dollar figures only mean something when Claude Code bills by usage. On a subscription plan they're
-// estimates nobody pays, so the app leaves them out.
-const billedByUsage = () => S.status?.claude?.billing !== "plan";
+// estimates nobody pays, so the app leaves them out. Cortex Code reports none: it bills Snowflake credits.
+const billedByUsage = () => S.status?.billing !== "plan";
+const agentId = () => S.status?.agent?.id || "claude";
+const agentName = () => S.status?.agent?.name || "Claude Code";
 const money = (n) => (n && billedByUsage() ? `$${n.toFixed(2)}` : "");
 const plural = (n, word, many = word + "s") => `${n} ${n === 1 ? word : many}`;
 
@@ -216,7 +218,7 @@ const latestReview = (run) => run.events.findLast((e) => e.type === "review");
 // ───────────── rail ─────────────
 function renderRail() {
   const ws = S.status?.workspace;
-  const claude = S.status?.claude;
+  const agent = S.status?.agent;
   const sel = S.view === "session" ? S.run?.id : null;
   const closed = store("rail-closed") === "1";
   const lane = (key) => {
@@ -232,13 +234,13 @@ function renderRail() {
         <span class="sub">${esc(st.label)} · ${esc(touched(r))}</span></button>`;
     })
     .join("");
-  const claudeLine = !claude
+  const agentLine = !agent
     ? ""
-    : !claude.found
-      ? `<span class="dot err"></span><span>Claude Code not found</span>`
-      : !claude.signedIn
-        ? `<span class="dot warn"></span><span>Claude Code not signed in</span>`
-        : `<span class="dot ok"></span><span>Claude Code ${esc(claude.version)}</span>`;
+    : !agent.found
+      ? `<span class="dot err"></span><span>${esc(agent.name)} not found</span>`
+      : !agent.signedIn
+        ? `<span class="dot warn"></span><span>${esc(agent.name)} not ${agent.id === "cortex" ? "connected" : "signed in"}</span>`
+        : `<span class="dot ok"></span><span>${esc(agent.name)} ${esc(agent.version)}</span>`;
   $("#rail").innerHTML = `
     <button class="brand" data-go="home"><img class="m" src="coalesce-mark.svg" alt="">Build with Agents</button>
     <button class="nav ${S.view === "home" ? "on" : ""}" data-go="home">${icon("home")}Home</button>
@@ -254,12 +256,12 @@ function renderRail() {
     <div class="foot">
       ${ws ? `<div class="ln" title="${esc(ws.path)}">${icon("folder")}<span>${esc(ws.name)} · ${ws.nodeCount} nodes</span></div>` : ""}
       <button class="ln ${S.view === "settings" ? "on" : ""}" data-go="settings">${icon("gear")}<span>Settings</span></button>
-      ${claudeLine ? `<button class="ln ${S.view === "claude" ? "on" : ""}" data-go="claude">${claudeLine}</button>` : ""}
+      ${agentLine ? `<button class="ln ${S.view === "agent" ? "on" : ""}" data-go="agent">${agentLine}</button>` : ""}
     </div>`;
 }
 
 // ───────────── pages ─────────────
-// Home, Plans, setup, settings and Claude Code share one shell: the changes pane
+// Home, Plans, setup, settings and the agent page share one shell: the changes pane
 // hidden, and a centered column that scrolls.
 function page(html, wide = false) {
   hideChanges();
@@ -282,16 +284,30 @@ function section(title, body, { side = "", note = "" } = {}) {
 
 // ───────────── setup ─────────────
 const cmd = (c) => `<div class="cmd"><code>${c}</code><button class="btn ghost icon sm" data-copy="${c}" title="Copy">${icon("copy")}</button></div>`;
+// Getting each agent installed and signed in.
+const AGENT_HELP = {
+  claude: {
+    install: `<div>Install it with this command in a terminal, then check again:</div>
+      ${cmd("curl -fsSL https://claude.ai/install.sh | bash")}
+      <div>On Windows, see <a href="https://docs.claude.com/en/docs/claude-code/setup" target="_blank" rel="noopener">the setup guide</a>.</div>`,
+    login: `<div>Open a terminal, run this, and follow the sign-in steps. Any Claude plan, Console account or company setup (Bedrock, Vertex) works.</div>
+      ${cmd("claude")}`,
+  },
+  cortex: {
+    install: `<div>Install it with this command in a terminal, then check again:</div>
+      ${cmd("curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | sh")}
+      <div>On Windows, see <a href="https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-cli" target="_blank" rel="noopener">the setup guide</a>.</div>`,
+    login: `<div>Open a terminal, run this, and follow the steps to connect it to your Snowflake account.</div>
+      ${cmd("cortex")}`,
+  },
+};
 const HELP = {
-  install: `<div>Install it with this command in a terminal, then check again:</div>
-    ${cmd("curl -fsSL https://claude.ai/install.sh | bash")}
-    <div>On Windows, see <a href="https://docs.claude.com/en/docs/claude-code/setup" target="_blank" rel="noopener">the setup guide</a>.</div>`,
-  login: `<div>Open a terminal, run this, and follow the sign-in steps. Any Claude plan, Console account or company setup (Bedrock, Vertex) works.</div>
-    ${cmd("claude")}`,
   sources: `<div>Add the tables you want to build from as source nodes in Coalesce, then check again.</div>`,
   locations: `<div>Open Build Settings › Storage Locations and add where sources live and where new tables should go.</div>`,
   nodeTypes: `<div>Optional. Without node types the agent can still write SQL nodes, but installing the base package from Build Settings › Packages gives it more to match.</div>`,
 };
+
+const helpFor = (key) => AGENT_HELP[agentId()][key] || HELP[key];
 
 function checkList() {
   const rows = (S.status?.checks || [])
@@ -300,21 +316,31 @@ function checkList() {
       const mark = c.ok ? icon("check") : c.optional ? icon("bang") : icon("x");
       return `<div class="check ${state}"><span class="mk">${mark}</span><div>
         <b>${esc(c.label)}</b><div class="d">${mdLine(c.detail)}</div>
-        ${!c.ok && c.help && HELP[c.help] ? `<div class="help">${HELP[c.help]}</div>` : ""}
+        ${!c.ok && c.help && helpFor(c.help) ? `<div class="help">${helpFor(c.help)}</div>` : ""}
       </div></div>`;
     })
     .join("");
   return `<div class="panel">${rows || '<div class="check"><span></span><div class="t3">Checking…</div></div>'}</div>`;
 }
 
-const APP_SETTINGS_NOTE = `Sessions run with this app's own Claude Code settings. Your personal Claude Code settings, hooks, plugins and CLAUDE.md aren't used, so what you've set up for yourself won't change how the app behaves, and nothing here changes your own Claude Code. Usage counts against your own Claude plan or API key.`;
+const APP_SETTINGS_NOTES = {
+  claude: `Sessions run with this app's own Claude Code settings. Your personal Claude Code settings, hooks, plugins and CLAUDE.md aren't used, so what you've set up for yourself won't change how the app behaves, and nothing here changes your own Claude Code. Usage counts against your own Claude plan or API key.`,
+  cortex: `Sessions run with this app's own tools and skills. Your personal Cortex Code settings, skills, plugins and MCP servers aren't used, so what you've set up for yourself won't change how the app behaves, and nothing here changes your own Cortex Code. The agent can't run SQL. Usage is billed to your Snowflake account as Cortex credits.`,
+};
+const appSettingsNote = () => `<p class="note">${APP_SETTINGS_NOTES[agentId()]}</p>`;
+
+// Which agent the app drives. Shown on setup too, so someone with only one of them isn't stuck.
+function agentPicker() {
+  return `<div class="panel">${choice("agent", "Agent", "The coding agent that plans and builds. It runs on this computer, signed in as you. Threads keep the agent they started with.")}</div>`;
+}
 
 function renderSetup() {
   const ready = S.status?.ready;
   page(`
-    ${pageHead("Before you start", "Build with Agents uses Claude Code on this computer to build pipelines in your workspace. Here's what it needs.")}
+    ${pageHead("Before you start", "Build with Agents uses Claude Code or Cortex Code on this computer to build pipelines in your workspace. Here's what it needs.")}
+    ${agentPicker()}
     ${checkList()}
-    <p class="note">${APP_SETTINGS_NOTE}</p>
+    ${appSettingsNote()}
     <div class="foot">
       <button class="btn subtle" id="recheck">Check again</button>
       <span class="grow"></span>
@@ -322,9 +348,11 @@ function renderSetup() {
     </div>`);
 }
 
-// ───────────── settings and Claude Code ─────────────
+// ───────────── settings and the agent ─────────────
 // Choices offered on the two pages. The first option is the default; the server keeps the same lists.
 const CHOICES = {
+  agent: [["claude", "Claude Code"], ["cortex", "Cortex Code"]],
+  cortexModel: [["", "Auto (recommended)"], ["claude-opus-5-5", "Opus 5.5"], ["claude-sonnet-5-5", "Sonnet 5.5"]],
   budgetUsd: [[0, "No limit"], [2, "$2"], [5, "$5"], [10, "$10"]],
   maxTurns: [[80, "80 (recommended)"], [40, "40"], [150, "150"]],
   model: [["opus", "Opus (recommended)"], ["sonnet", "Sonnet"], ["fable", "Fable"], ["", "Your Claude Code default"]],
@@ -342,10 +370,20 @@ function modelName(id = S.status?.defaultModel) {
   return m ? `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}${m[3] ? `.${m[3]}` : ""}` : id || "";
 }
 
+// What an option reads as, where that depends on this computer.
+function choiceLabel(key, value, label) {
+  if (key === "agent") return (S.status?.agents || []).find((a) => a.id === value)?.found === false ? `${label} (not installed)` : label;
+  if (value !== "" || !modelName()) return label;
+  if (key === "model") return `Your Claude Code default (${modelName()})`;
+  if (key === "cortexModel") return `Auto (recommended, now ${modelName()})`;
+  return label;
+}
+
 function choice(key, label, hint) {
-  const cur = S.settings?.[key] ?? CHOICES[key][0][0];
+  // With no agent chosen yet, the app is using whichever one it found.
+  const cur = key === "agent" ? agentId() : S.settings?.[key] ?? CHOICES[key][0][0];
   const opts = CHOICES[key]
-    .map(([v, l]) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(key === "model" && v === "" && modelName() ? `Your Claude Code default (${modelName()})` : l)}</option>`)
+    .map(([v, l]) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(choiceLabel(key, v, l))}</option>`)
     .join("");
   return prow(label, `<select class="pick" data-setting="${key}">${opts}</select>`, hint);
 }
@@ -359,21 +397,31 @@ function renderSettings() {
     ${pageHead("Settings", "For Build with Agents on this computer.")}
     ${section("Setup", checkList(), { side: recheckBtn })}
     ${section("Sessions", `<div class="panel">
-      ${billedByUsage() ? choice("budgetUsd", "Spending limit per reply", "The agent stops a reply partway once it has spent this much.") : ""}
+      ${agentId() === "claude" && billedByUsage() ? choice("budgetUsd", "Spending limit per reply", "The agent stops a reply partway once it has spent this much.") : ""}
       ${choice("maxTurns", "Steps per reply", "How many reads and edits the agent can make before it stops and checks in.")}
       ${ws ? prow("Workspace", `<span title="${esc(ws.path)}">${esc(ws.name)}</span>`) : ""}
       ${st?.storage ? prow("Session copies", `<span class="mono path" title="${esc(st.storage)}">${esc(st.storage.replace(/^\/(Users|home)\/[^/]+/, "~"))}</span>`, "Each session works in its own copy of the workspace, stored here.") : ""}
     </div>`, { side: '<span class="saved" id="saved-app"></span>' })}`);
 }
 
-function renderClaude() {
-  const c = S.status?.claude;
+function renderAgent() {
+  const c = S.status?.agent;
+  const cortex = c?.id === "cortex";
+  const name = agentName();
   const a = c?.account || {};
   const plan = a.plan ? a.plan[0].toUpperCase() + a.plan.slice(1) : "";
+  const missing = (what, help) => `<div class="prow col1"><div class="pl"><b>${esc(name)} ${what}</b><div class="help">${help}</div></div></div>`;
   let account;
   if (!c) account = prow("Status", `<span class="t3">Checking…</span>`);
-  else if (!c.found) account = `<div class="prow col1"><div class="pl"><b>Claude Code isn't installed</b><div class="help">${HELP.install}</div></div></div>`;
-  else if (!c.signedIn) account = `<div class="prow col1"><div class="pl"><b>Claude Code isn't signed in</b><div class="help">${HELP.login}</div></div></div>`;
+  else if (!c.found) account = missing("isn't installed", helpFor("install"));
+  else if (!c.signedIn) account = missing(cortex ? "has no Snowflake connection" : "isn't signed in", helpFor("login"));
+  else if (cortex)
+    account = [
+      prow("Version", esc(c.version)),
+      prow("Snowflake account", esc(a.snowflakeAccount || ""), "Usage is billed here as Cortex credits, so the app doesn't show dollar costs."),
+      prow("User", esc(a.user || "")),
+      prow("Connection", esc(a.connection || ""), "Cortex Code's active connection. Change it with <code>cortex connections set</code>."),
+    ].join("");
   else
     account = [
       prow("Version", esc(c.version)),
@@ -381,17 +429,21 @@ function renderClaude() {
       plan ? prow("Plan", esc(plan), billedByUsage() ? "" : "Threads count toward this plan's usage, so the app doesn't show dollar costs.") : "",
       a.org ? prow("Organization", esc(a.org)) : "",
     ].join("");
+  const cost = cortex ? "more Snowflake credits" : "more of your plan";
   page(`
-    ${pageHead("Claude Code", "Build with Agents uses the Claude Code installed on this computer.")}
+    ${pageHead(name, `Build with Agents uses the ${esc(name)} installed on this computer.`)}
+    ${agentPicker()}
     ${section("Account", `<div class="panel">${account}</div>`, { side: recheckBtn })}
     ${skillsSection()}
-    ${connectorsSection()}
+    ${cortex ? "" : connectorsSection()}
     ${section("How the agent works", `<div class="panel">
-      ${choice("model", "Model", "The app uses Opus unless you pick another here, whatever your own Claude Code is set to. Larger models use more of your plan.")}
-      ${choice("effort", "Effort", "How long the agent thinks on each step. Higher is slower and uses more of your plan.")}
-      ${choice("compact", "Summarize long sessions", "When a session's conversation gets long, the agent summarizes the older parts so it can keep going.")}
-    </div>`, { side: '<span class="saved" id="saved-claude"></span>', note: "The defaults suit most pipelines. Changes apply from the next message you send." })}
-    <p class="note">${APP_SETTINGS_NOTE}</p>`);
+      ${cortex
+        ? choice("cortexModel", "Model", "Auto lets Snowflake pick the best model your account can use. Larger models use more Snowflake credits.")
+        : choice("model", "Model", "The app uses Opus unless you pick another here, whatever your own Claude Code is set to. Larger models use more of your plan.")}
+      ${choice("effort", "Effort", `How long the agent thinks on each step. Higher is slower and uses ${cost}.`)}
+      ${cortex ? "" : choice("compact", "Summarize long sessions", "When a session's conversation gets long, the agent summarizes the older parts so it can keep going.")}
+    </div>`, { side: '<span class="saved"></span>', note: "The defaults suit most pipelines. Changes apply from the next message you send." })}
+    ${appSettingsNote()}`);
 }
 
 const skillTitle = (name) => name.replace(/^coalesce-/, "").replace(/-/g, " ").replace(/^./, (c) => c.toUpperCase());
@@ -439,7 +491,7 @@ async function fetchOnce(key, url) {
     S[key] = null;
   }
   fetching.delete(key);
-  if (S.view === "claude") renderClaude();
+  if (S.view === "agent") renderAgent();
 }
 
 async function saveSetting(el) {
@@ -449,6 +501,12 @@ async function saveSetting(el) {
   const flag = el.closest(".sec")?.querySelector(".saved");
   try {
     S.settings = await api("PUT", "api/settings", { [key]: value });
+    // The other agent has its own setup checks, account and options: redraw with them.
+    if (key === "agent") {
+      S.status = await api("GET", "api/status");
+      renderRail();
+      return renderView();
+    }
     if (flag) {
       flag.textContent = "Saved";
       flag.classList.add("on");
@@ -573,7 +631,7 @@ function renderHome() {
     ${S.runs.length ? timeline() : ""}
     <section class="compose">
       <h1>What do you want to build?</h1>
-      ${ready === false ? `<div class="notice warn">Claude Code needs setting up first. <a href="#" data-go="setup">Open setup</a></div>` : ""}
+      ${ready === false ? `<div class="notice warn">${esc(agentName())} needs setting up first. <a href="#" data-go="setup">Open setup</a></div>` : ""}
       ${composer({
         id: "spec",
         send: "build",
@@ -1097,7 +1155,7 @@ function renderSession() {
     }
   };
 
-  // One turn per message from the person. A finished turn folds Claude's work into a single line;
+  // One turn per message from the person. A finished turn folds the agent's work into a single line;
   // what stays in view is what the person said, anything that went wrong, and the latest review.
   const turns = [];
   items.forEach((e, i) => {
@@ -1454,7 +1512,7 @@ function go(view) {
 function renderView() {
   if (S.view === "setup") renderSetup();
   else if (S.view === "settings") renderSettings();
-  else if (S.view === "claude") renderClaude();
+  else if (S.view === "agent") renderAgent();
   else if (S.view === "home") renderHome();
   else if (LANES[S.view]) renderLane();
   else if (S.view === "builder") renderBuilder();
@@ -1654,7 +1712,7 @@ document.addEventListener("click", (e) => {
     case "recheck": t.disabled = true; return recheck();
     case "refresh-connectors":
       t.textContent = "Checking…";
-      return api("GET", "api/connectors?refresh").then((c) => { S.connectors = c; renderClaude(); }).catch(() => renderClaude());
+      return api("GET", "api/connectors?refresh").then((c) => { S.connectors = c; renderAgent(); }).catch(() => renderAgent());
     case "setup-done": store("setup-done", "1"); return go("home");
   }
 });
@@ -1758,6 +1816,6 @@ initResize();
   if (!status.ready || location.hash === "#setup" || (!store("setup-done") && !S.runs.length)) return go("setup");
   if (id && S.runs.some((r) => r.id === id)) return openSession(id);
   if (at === "#review") return go("plans");
-  if (["#settings", "#claude", "#builder", "#plans", "#builds", "#applied"].includes(at)) return go(at.slice(1));
+  if (["#settings", "#agent", "#builder", "#plans", "#builds", "#applied"].includes(at)) return go(at.slice(1));
   go("home");
 })();
