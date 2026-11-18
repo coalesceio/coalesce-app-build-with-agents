@@ -4,6 +4,8 @@ All notable changes to the Build with Agents app. Format follows [Keep a Changel
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-18
+
 ### Added
 - **Cortex Code as the agent.** Pick Claude Code or Snowflake Cortex Code on the setup page or the agent page. Cortex Code runs on your Snowflake connection, and its usage is billed to that account as Cortex credits. It gets the same plan, build, validate and review steps, the same bundled skills, and the same limits: file tools only, no SQL and no shell. With only Cortex Code installed, the app uses it without being told.
 
