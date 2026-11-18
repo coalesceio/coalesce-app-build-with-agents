@@ -50,6 +50,8 @@ const AGENTS = {
     name: "Cortex Code",
     exe: "cortex",
     override: "CORTEX_PATH",
+    // Other tools are also called cortex; this one's --version says "Cortex Code v1.2.46".
+    signature: /Cortex Code/i,
     authLabel: "Cortex Code has a Snowflake connection",
     authFix: "Run `cortex` once in a terminal and set up a connection.",
   },
@@ -209,12 +211,14 @@ function findAgent(id, force = false) {
   return agentPromises[id];
 }
 
-// The agent new threads use: the person's choice, or else whichever is installed, Claude Code first.
-// A thread stays on the agent it started with, since its conversation lives in that agent's sessions.
+// The agent new threads use: the person's choice, or else one that's installed and signed in, or
+// failing that just installed, Claude Code first each time. So installing a second agent doesn't
+// move someone off the one that works. A thread stays on the agent it started with, since its
+// conversation lives in that agent's sessions.
 async function activeAgent(force = false) {
-  const [settings, claude, cortex] = await Promise.all([readSettings(), findAgent("claude", force), findAgent("cortex", force)]);
-  const id = settings.agent || (!claude.found && cortex.found ? "cortex" : "claude");
-  return id === "cortex" ? cortex : claude;
+  const [settings, ...found] = await Promise.all([readSettings(), findAgent("claude", force), findAgent("cortex", force)]);
+  if (settings.agent) return found.find((a) => a.id === settings.agent);
+  return found.find((a) => a.found && a.account?.loggedIn) || found.find((a) => a.found) || found[0];
 }
 
 async function locateAgent(agent) {
@@ -239,10 +243,10 @@ async function locateAgent(agent) {
       exec(candidate, ["--version"], { env, timeout: 20_000 }),
       exec(candidate, agent.id === "cortex" ? ["connections", "list"] : ["auth", "status"], { env, timeout: 20_000 }),
     ]);
-    if (r.code !== 0) continue;
+    if (r.code !== 0 || (agent.signature && !agent.signature.test(r.stdout))) continue;
     // "2.1.5 (Claude Code)" and "Cortex Code v1.2.46".
     const version = (r.stdout.match(/\d+(?:\.\d+)+/) || [r.stdout.trim()])[0];
-    const account = agent.id === "cortex" ? cortexAccount(auth) : claudeAccount(auth);
+    const account = agent.id === "cortex" ? cortexAccount(auth, env) : claudeAccount(auth);
     return { ...agent, found: true, path: candidate, version, env, account };
   }
   return { ...agent, found: false, env };
@@ -259,16 +263,20 @@ function claudeAccount(auth) {
 
 // Cortex Code signs in through a Snowflake connection. Having an active one is as far as the app
 // checks: trying it could open a browser for single sign-on. A connection that doesn't work shows
-// up as an error in the thread.
-function cortexAccount(list) {
+// up as an error in the thread. Setup is only held up when there is plainly no connection at all;
+// if the list can't be read, or the connection may come from somewhere else (SNOWFLAKE_*
+// variables), the check says so and lets the person carry on.
+function cortexAccount(list, env) {
+  let listed;
   try {
-    const { active_connection: name, connections = {} } = JSON.parse(list.stdout);
-    const connection = connections[name];
-    if (!connection) return { loggedIn: false };
-    return { loggedIn: true, connection: name, snowflakeAccount: connection.account, user: connection.user };
+    listed = JSON.parse(list.stdout) || {};
   } catch {
-    return { loggedIn: false };
+    return { loggedIn: false, unsure: true };
   }
+  const connections = listed.connections || {};
+  const connection = connections[listed.active_connection];
+  if (connection) return { loggedIn: true, connection: listed.active_connection, snowflakeAccount: connection.account, user: connection.user };
+  return { loggedIn: false, unsure: Object.keys(connections).length > 0 || Boolean(env.SNOWFLAKE_ACCOUNT) };
 }
 
 // A claude.ai login on Anthropic's own API bills against a plan (Pro, Max, Team, Enterprise), so
@@ -448,8 +456,9 @@ const runDir = (id) => path.join(RUNS_DIR, id);
 const baseDir = (id) => path.join(runDir(id), "base");
 const workDir = (id) => path.join(runDir(id), "work");
 const beforeDir = (id) => path.join(runDir(id), "before-add");
-// Where a turn's prompt goes when it's too long to pass to Cortex Code as an argument.
-const promptFile = (id) => path.join(runDir(id), "prompt.md");
+// Where a turn's prompt goes when it's too long to pass to Cortex Code as an argument: inside the
+// agent's working directory, in the folder the change list ignores.
+const promptFile = (id) => path.join(workDir(id), ".cortex", "prompt.md");
 
 function plain(text) {
   return text.replace(/\*\*|`|^#+\s*|^>\s*/gm, "").replace(/\s+/g, " ").trim();
@@ -614,13 +623,13 @@ function handleAgentMessage(run, msg) {
     for (const block of msg.message.content) {
       if (block.type === "text" && block.text.trim()) {
         // Cortex Code also sends the structured output as a message; the card shows that.
-        if (!isJsonObject(block.text)) emit(run, { type: "text", text: block.text });
+        if (agentOf(run) !== "cortex" || !isJsonObject(block.text)) emit(run, { type: "text", text: block.text });
       } else if (block.type === "tool_use") {
         const name = TOOL_ALIASES[block.name] || block.name;
         if (name === "TodoWrite") {
           run.todos = (block.input.todos || []).map((t) => ({ content: t.content, status: t.status, activeForm: t.activeForm }));
           emit(run, { type: "todos", todos: run.todos });
-        } else if (name === "Read" && block.input?.file_path === promptFile(run.id)) {
+        } else if (name === "Read" && path.resolve(workDir(run.id), block.input?.file_path || "") === promptFile(run.id)) {
           // The agent picking up its own instructions isn't progress worth a line.
         } else if (!QUIET_TOOLS.has(name)) {
           const d = describeTool(run, name, block.input);
@@ -646,7 +655,9 @@ function handleAgentMessage(run, msg) {
   }
   if (msg.type === "result") {
     run.sawResult = true;
-    if (agentOf(run) === "cortex") noteModel(run, Object.keys(msg.modelUsage || {})[0]);
+    // The model that wrote the most, in case a helper model is listed beside it.
+    const byOutput = Object.entries(msg.modelUsage || {}).sort((a, b) => (b[1]?.outputTokens || 0) - (a[1]?.outputTokens || 0));
+    if (agentOf(run) === "cortex") noteModel(run, byOutput[0]?.[0]);
     // Cortex Code reports no cost: its usage is billed as Snowflake credits.
     run.costUsd = (run.costUsd || 0) + (msg.total_cost_usd || 0);
     if (msg.structured_output && typeof msg.structured_output === "object") {
@@ -714,7 +725,12 @@ async function startTurn(run, prompt, { phase = run.phase, fixing = false } = {}
         run.stderrTail = (run.stderrTail + line + "\n").slice(-2000);
         continue;
       }
-      handleAgentMessage(run, msg);
+      // A message in a shape the handler doesn't expect is skipped, not left to take the server down.
+      try {
+        handleAgentMessage(run, msg);
+      } catch (error) {
+        console.error("skipping a message the app couldn't read", error);
+      }
     }
   });
   child.stderr.on("data", (chunk) => {
@@ -1118,7 +1134,8 @@ async function loadRuns() {
 function setupChecks(agent, ws) {
   const account = agent.account || {};
   const signedIn = agent.found && account.loggedIn;
-  const via = account.connection ? `${account.user} on ${account.snowflakeAccount}` : account.email || account.authMethod || account.apiProvider;
+  const via = account.connection ? [account.user, account.snowflakeAccount].filter(Boolean).join(" on ") : account.email || account.authMethod || account.apiProvider;
+  const unsure = Boolean(agent.found && !signedIn && account.unsure);
   return [
     {
       id: "agent",
@@ -1131,8 +1148,9 @@ function setupChecks(agent, ws) {
       id: "auth",
       label: agent.authLabel,
       ok: Boolean(signedIn),
-      detail: signedIn ? (via ? `As ${via}` : "Signed in") : agent.found ? agent.authFix : `Needs ${agent.name} first.`,
-      help: signedIn ? "" : "login",
+      optional: unsure || undefined,
+      detail: signedIn ? (via ? `As ${via}` : "Signed in") : unsure ? "Couldn't confirm one. If `cortex` works in your terminal, carry on." : agent.found ? agent.authFix : `Needs ${agent.name} first.`,
+      help: signedIn || unsure ? "" : "login",
     },
     {
       id: "nodes",
@@ -1246,6 +1264,7 @@ async function route(req, res) {
         found: agent.found,
         version: agent.version,
         signedIn: Boolean(a && a.loggedIn),
+        unsure: Boolean(a && a.unsure),
         account: !a
           ? null
           : agent.id === "cortex"

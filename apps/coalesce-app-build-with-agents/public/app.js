@@ -414,12 +414,12 @@ function renderAgent() {
   let account;
   if (!c) account = prow("Status", `<span class="t3">Checking…</span>`);
   else if (!c.found) account = missing("isn't installed", helpFor("install"));
-  else if (!c.signedIn) account = missing(cortex ? "has no Snowflake connection" : "isn't signed in", helpFor("login"));
+  else if (!c.signedIn) account = missing(cortex ? (c.unsure ? "may not have a Snowflake connection" : "has no Snowflake connection") : "isn't signed in", helpFor("login"));
   else if (cortex)
     account = [
       prow("Version", esc(c.version)),
       prow("Snowflake account", esc(a.snowflakeAccount || ""), "Usage is billed here as Cortex credits, so the app doesn't show dollar costs."),
-      prow("User", esc(a.user || "")),
+      a.user ? prow("User", esc(a.user)) : "",
       prow("Connection", esc(a.connection || ""), "Cortex Code's active connection. Change it with <code>cortex connections set</code>."),
     ].join("");
   else
