@@ -17,6 +17,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const locate = require("./locate");
 
 const PORT = Number(process.env.PORT) || 8455;
 const WORKSPACE = path.resolve(process.env.WORKSPACE_DIR || path.resolve(__dirname, "../.."));
@@ -42,6 +43,8 @@ const AGENTS = {
     name: "Claude Code",
     exe: "claude",
     override: "CLAUDE_PATH",
+    // "2.1.5 (Claude Code)". On Windows an old Claude desktop app can also answer to `claude`.
+    signature: /Claude Code/i,
     authLabel: "Claude Code is signed in",
     authFix: "Run `claude` once in a terminal and sign in.",
   },
@@ -52,6 +55,9 @@ const AGENTS = {
     override: "CORTEX_PATH",
     // Other tools are also called cortex; this one's --version says "Cortex Code v1.2.46".
     signature: /Cortex Code/i,
+    // The Windows installer puts only a cortex.cmd launcher on PATH and keeps cortex.exe in a folder
+    // per version, so look there too in case the launcher can't be read.
+    versioned: (env) => [path.win32.join(locate.getEnv(env, "LOCALAPPDATA") || path.win32.join(os.homedir(), "AppData", "Local"), "cortex")],
     authLabel: "Cortex Code has a Snowflake connection",
     authFix: "Run `cortex` once in a terminal and set up a connection.",
   },
@@ -142,7 +148,7 @@ function exec(cmd, args, { env, timeout = 10_000 } = {}) {
     let stderr = "";
     let child;
     try {
-      child = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(cmd, args, { env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     } catch (error) {
       resolve({ code: -1, stdout, stderr: String(error) });
       return;
@@ -172,24 +178,43 @@ async function readText(file) {
 // ───────────── agents ─────────────
 
 // An app launched from the Dock doesn't inherit the shell's PATH, so ask a login shell for it and
-// add the usual install locations. The login shell is slow, so ask once and again only on a recheck.
+// add the usual install locations. On Windows the PATH a new terminal gets is in the registry, and
+// this process's copy dates from when Coalesce started, so read the registry. Either is slow-ish,
+// so ask once and again only on a recheck.
 let pathPromise;
 function resolvePath(force = false) {
   if (!pathPromise || force) pathPromise = readPath();
   return pathPromise;
 }
 async function readPath() {
+  const win = process.platform === "win32";
   const parts = [];
-  if (process.platform !== "win32") {
+  if (win) parts.push(...(await registryPath()));
+  else {
     const shell = process.env.SHELL || "/bin/zsh";
     const r = await exec(shell, ["-ilc", 'printf "__P__%s__P__" "$PATH"'], { timeout: 6000 });
     const m = r.stdout.match(/__P__(.*?)__P__/s);
     if (m) parts.push(...m[1].split(path.delimiter));
   }
-  parts.push(...(process.env.PATH || "").split(path.delimiter));
-  const home = os.homedir();
-  parts.push(path.join(home, ".local", "bin"), path.join(home, ".claude", "local"), "/opt/homebrew/bin", "/usr/local/bin");
-  return [...new Set(parts.filter(Boolean))].join(path.delimiter);
+  parts.push(...locate.splitPath(locate.getEnv(process.env, "PATH"), process.platform));
+  parts.push(...locate.knownDirs({ platform: process.platform, env: process.env, home: os.homedir() }));
+  const seen = new Set();
+  return parts
+    .filter((d) => {
+      const k = win ? d.toLowerCase().replace(/[\\/]+$/, "") : d;
+      if (!d || seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .join(path.delimiter);
+}
+
+// The system PATH, then the user's, as a newly opened terminal would put them together.
+async function registryPath() {
+  const reg = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "reg.exe");
+  const keys = ["HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "HKCU\\Environment"];
+  const values = await Promise.all(keys.map((k) => exec(reg, ["query", k, "/v", "Path"], { timeout: 5000 })));
+  return values.flatMap((r) => locate.splitPath(locate.expandWindowsVars(locate.parseRegQuery(r.stdout), process.env), "win32"));
 }
 
 // Ignoring the user's settings also drops their `env` block, which is where Bedrock, Vertex,
@@ -223,33 +248,58 @@ async function activeAgent(force = false) {
 
 async function locateAgent(agent) {
   const PATH = await resolvePath();
-  const env = { ...process.env, ...(agent.id === "claude" ? await providerEnv() : {}), PATH, COALESCE_APP: "build-with-agents" };
+  const env = locate.withPath({ ...process.env, ...(agent.id === "claude" ? await providerEnv() : {}), COALESCE_APP: "build-with-agents" }, PATH, process.platform);
   delete env.ELECTRON_RUN_AS_NODE;
   // If Coalesce was started from inside a Claude Code session, that session's variables (its id,
   // plugin dirs, messaging socket) would leak into ours. Keep only the ones that choose a provider.
   delete env.CLAUDECODE;
   for (const k of Object.keys(env)) if (/^CLAUDE_CODE_/.test(k) && !PROVIDER_ENV.test(k) && k !== "CLAUDE_CODE_OAUTH_TOKEN") delete env[k];
-  const exe = process.platform === "win32" ? `${agent.exe}.exe` : agent.exe;
-  const candidates = process.env[agent.override]
-    ? [process.env[agent.override]]
-    : PATH.split(path.delimiter).map((dir) => path.join(dir, exe));
-  for (const candidate of candidates) {
-    try {
-      await fsp.access(candidate, fs.constants.X_OK);
-    } catch {
-      continue;
-    }
-    const [r, auth] = await Promise.all([
-      exec(candidate, ["--version"], { env, timeout: 20_000 }),
-      exec(candidate, agent.id === "cortex" ? ["connections", "list"] : ["auth", "status"], { env, timeout: 20_000 }),
-    ]);
+  const ctx = commandContext(env, PATH);
+  // `path` is the program the app runs, and `args` go before every command line it builds. For a
+  // Windows launcher script they're the program the script starts (and the script it hands to Node,
+  // for an npm install). `foundAt` is what PATH led to.
+  const runs = await locate.findCommands(agent.exe, ctx, {
+    dirs: locate.splitPath(PATH, process.platform),
+    override: process.env[agent.override],
+    versionedRoots: agent.versioned ? agent.versioned(env) : [],
+  });
+  for (const run of runs) {
+    // Check --version first so an unrelated binary on PATH isn't invoked with auth subcommands
+    // (or left blocking for the full timeout when --version already ruled it out).
+    const r = await exec(run.cmd, [...run.args, "--version"], { env, timeout: 20_000 });
     if (r.code !== 0 || (agent.signature && !agent.signature.test(r.stdout))) continue;
     // "2.1.5 (Claude Code)" and "Cortex Code v1.2.46".
     const version = (r.stdout.match(/\d+(?:\.\d+)+/) || [r.stdout.trim()])[0];
+    const auth = await exec(run.cmd, [...run.args, ...(agent.id === "cortex" ? ["connections", "list"] : ["auth", "status"])], { env, timeout: 20_000 });
     const account = agent.id === "cortex" ? cortexAccount(auth, env) : claudeAccount(auth);
-    return { ...agent, found: true, path: candidate, version, env, account };
+    return { ...agent, found: true, path: run.cmd, args: run.args, foundAt: run.foundAt, version, env, account };
   }
   return { ...agent, found: false, env };
+}
+
+// The file checks locate.js needs. On macOS and Linux a candidate must be executable; Windows has no
+// such bit, so there it only has to be a file.
+function commandContext(env, PATH) {
+  const isFile = async (file) => {
+    try {
+      if (!(await fsp.stat(file)).isFile()) return false;
+      if (process.platform !== "win32") await fsp.access(file, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  return {
+    platform: process.platform,
+    env,
+    isFile,
+    readFile: readText,
+    readdir: (dir) => fsp.readdir(dir),
+    findNode: async () => {
+      for (const c of locate.commandCandidates("node.exe", locate.splitPath(PATH, process.platform), { platform: process.platform })) if (await isFile(c)) return c;
+      return null;
+    },
+  };
 }
 
 function claudeAccount(auth) {
@@ -313,7 +363,7 @@ async function listConnectors(force) {
   if (connectorsCache && !force && Date.now() - connectorsCache.at < 5 * 60_000) return connectorsCache.value;
   const claude = await findAgent("claude");
   if (!claude.found) return { items: [], error: "Claude Code isn't installed." };
-  const r = await exec(claude.path, ["mcp", "list"], { env: claude.env, timeout: 90_000 });
+  const r = await exec(claude.path, [...claude.args, "mcp", "list"], { env: claude.env, timeout: 90_000 });
   const items = [];
   for (const line of r.stdout.split("\n")) {
     const m = line.match(/^(.+?): (\S.*?) - (✔|✓|✗|✘|!|⏸)\s*(.*)$/);
@@ -699,7 +749,7 @@ async function startTurn(run, prompt, { phase = run.phase, fixing = false } = {}
   run.stopping = false;
   run.stderrTail = "";
   run.turnStarted = Date.now();
-  const child = spawn(agent.path, args, { cwd: workDir(run.id), env: agent.env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(agent.path, [...agent.args, ...args], { cwd: workDir(run.id), env: agent.env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
   run.child = child;
   run.phase = phase;
   run.fixing = fixing;
@@ -1256,6 +1306,8 @@ async function route(req, res) {
     const a = agent.account;
     return sendJson(res, 200, {
       dev: DEV,
+      // The setup help shows the install command for this computer's system.
+      platform: process.platform,
       ready: checks.every((c) => c.ok || c.optional),
       checks,
       agent: {
@@ -1263,6 +1315,7 @@ async function route(req, res) {
         name: agent.name,
         found: agent.found,
         version: agent.version,
+        location: agent.foundAt,
         signedIn: Boolean(a && a.loggedIn),
         unsure: Boolean(a && a.unsure),
         account: !a
