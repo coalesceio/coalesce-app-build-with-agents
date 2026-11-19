@@ -4,6 +4,8 @@ All notable changes to the Build with Agents app. Format follows [Keep a Changel
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-19
+
 ### Fixed
 - **Finding Claude Code and Cortex Code on Windows.** The app now finds an agent the way PowerShell and Command Prompt do: through `.cmd`, `.bat` and `.ps1` launchers as well as `.exe` files, so Cortex Code's installer (which puts only `cortex.cmd` on PATH) and npm installs of Claude Code (`claude.cmd`) are found. It runs the program the launcher starts rather than the launcher itself. It also looks in the usual install folders, and in Cortex Code's versioned install folder if the launcher can't be read.
 - **Check again on Windows** reads PATH from the registry, so an agent installed or added to PATH after Coalesce started is found without restarting Coalesce.
