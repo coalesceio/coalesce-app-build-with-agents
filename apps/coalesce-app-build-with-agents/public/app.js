@@ -284,19 +284,35 @@ function section(title, body, { side = "", note = "" } = {}) {
 
 // ───────────── setup ─────────────
 const cmd = (c) => `<div class="cmd"><code>${c}</code><button class="btn ghost icon sm" data-copy="${c}" title="Copy">${icon("copy")}</button></div>`;
-// Getting each agent installed and signed in.
+// Getting each agent installed and signed in. The install command is for the system the app runs on,
+// which is where the agent has to be.
+const onWindows = () => S.status?.platform === "win32";
+const installHelp = ({ unix, windows, guide }) =>
+  onWindows()
+    ? `<div>Install it with this command in PowerShell, then check again:</div>
+      ${cmd(windows)}
+      <div>On macOS or Linux, or if it doesn't work, see <a href="${guide}" target="_blank" rel="noopener">the setup guide</a>.</div>`
+    : `<div>Install it with this command in a terminal, then check again:</div>
+      ${cmd(unix)}
+      <div>On Windows, see <a href="${guide}" target="_blank" rel="noopener">the setup guide</a>.</div>`;
 const AGENT_HELP = {
   claude: {
-    install: `<div>Install it with this command in a terminal, then check again:</div>
-      ${cmd("curl -fsSL https://claude.ai/install.sh | bash")}
-      <div>On Windows, see <a href="https://docs.claude.com/en/docs/claude-code/setup" target="_blank" rel="noopener">the setup guide</a>.</div>`,
+    install: () =>
+      installHelp({
+        unix: "curl -fsSL https://claude.ai/install.sh | bash",
+        windows: "irm https://claude.ai/install.ps1 | iex",
+        guide: "https://docs.claude.com/en/docs/claude-code/setup",
+      }),
     login: `<div>Open a terminal, run this, and follow the sign-in steps. Any Claude plan, Console account or company setup (Bedrock, Vertex) works.</div>
       ${cmd("claude")}`,
   },
   cortex: {
-    install: `<div>Install it with this command in a terminal, then check again:</div>
-      ${cmd("curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | sh")}
-      <div>On Windows, see <a href="https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-cli" target="_blank" rel="noopener">the setup guide</a>.</div>`,
+    install: () =>
+      installHelp({
+        unix: "curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | sh",
+        windows: "irm https://ai.snowflake.com/static/cc-scripts/install.ps1 | iex",
+        guide: "https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code-cli",
+      }),
     login: `<div>Open a terminal, run this, and follow the steps to connect it to your Snowflake account.</div>
       ${cmd("cortex")}`,
   },
@@ -307,7 +323,10 @@ const HELP = {
   nodeTypes: `<div>Optional. Without node types the agent can still write SQL nodes, but installing the base package from Build Settings › Packages gives it more to match.</div>`,
 };
 
-const helpFor = (key) => AGENT_HELP[agentId()][key] || HELP[key];
+const helpFor = (key) => {
+  const help = AGENT_HELP[agentId()][key] || HELP[key];
+  return typeof help === "function" ? help() : help;
+};
 
 function checkList() {
   const rows = (S.status?.checks || [])
@@ -404,6 +423,9 @@ function renderSettings() {
     </div>`, { side: '<span class="saved" id="saved-app"></span>' })}`);
 }
 
+// Where the app found the agent, so a person with more than one install can tell which it uses.
+const agentLocation = (c) => (c.location ? prow("Location", `<span class="mono path" title="${esc(c.location)}">${esc(c.location)}</span>`) : "");
+
 function renderAgent() {
   const c = S.status?.agent;
   const cortex = c?.id === "cortex";
@@ -418,6 +440,7 @@ function renderAgent() {
   else if (cortex)
     account = [
       prow("Version", esc(c.version)),
+      agentLocation(c),
       prow("Snowflake account", esc(a.snowflakeAccount || ""), "Usage is billed here as Cortex credits, so the app doesn't show dollar costs."),
       a.user ? prow("User", esc(a.user)) : "",
       prow("Connection", esc(a.connection || ""), "Cortex Code's active connection. Change it with <code>cortex connections set</code>."),
@@ -425,6 +448,7 @@ function renderAgent() {
   else
     account = [
       prow("Version", esc(c.version)),
+      agentLocation(c),
       a.email ? prow("Signed in as", esc(a.email)) : prow("Signed in", esc(a.provider || a.method || "Yes")),
       plan ? prow("Plan", esc(plan), billedByUsage() ? "" : "Threads count toward this plan's usage, so the app doesn't show dollar costs.") : "",
       a.org ? prow("Organization", esc(a.org)) : "",

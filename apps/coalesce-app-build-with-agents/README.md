@@ -17,6 +17,6 @@ A Coalesce workspace app. Describe the pipelines you need, or attach a spec, and
 
 ## This repository
 
-The app's source is in this folder: `server.js` (no dependencies) and the page in `public/`.
+The app's source is in this folder: `server.js` (no dependencies), `locate.js` (finding the agent on each system) and the page in `public/`. Run the tests with `npm test` (Node's built-in test runner; the Windows cases run on any system).
 
 To release a version: add the changes to the `## [Unreleased]` section of `CHANGELOG.md`, merge them, then run **Release app** in [coalesce-app-releases](https://github.com/coalesceio/coalesce-app-releases).
