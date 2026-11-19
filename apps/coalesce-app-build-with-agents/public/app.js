@@ -291,7 +291,7 @@ const installHelp = ({ unix, windows, guide }) =>
   onWindows()
     ? `<div>Install it with this command in PowerShell, then check again:</div>
       ${cmd(windows)}
-      <div>On macOS or Linux, or if it doesn't work, see <a href="${guide}" target="_blank" rel="noopener">the setup guide</a>.</div>`
+      <div>If that doesn't work, see <a href="${guide}" target="_blank" rel="noopener">the setup guide</a>.</div>`
     : `<div>Install it with this command in a terminal, then check again:</div>
       ${cmd(unix)}
       <div>On Windows, see <a href="${guide}" target="_blank" rel="noopener">the setup guide</a>.</div>`;

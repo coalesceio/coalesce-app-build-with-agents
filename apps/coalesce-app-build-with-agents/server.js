@@ -264,13 +264,13 @@ async function locateAgent(agent) {
     versionedRoots: agent.versioned ? agent.versioned(env) : [],
   });
   for (const run of runs) {
-    const [r, auth] = await Promise.all([
-      exec(run.cmd, [...run.args, "--version"], { env, timeout: 20_000 }),
-      exec(run.cmd, [...run.args, ...(agent.id === "cortex" ? ["connections", "list"] : ["auth", "status"])], { env, timeout: 20_000 }),
-    ]);
+    // Check --version first so an unrelated binary on PATH isn't invoked with auth subcommands
+    // (or left blocking for the full timeout when --version already ruled it out).
+    const r = await exec(run.cmd, [...run.args, "--version"], { env, timeout: 20_000 });
     if (r.code !== 0 || (agent.signature && !agent.signature.test(r.stdout))) continue;
     // "2.1.5 (Claude Code)" and "Cortex Code v1.2.46".
     const version = (r.stdout.match(/\d+(?:\.\d+)+/) || [r.stdout.trim()])[0];
+    const auth = await exec(run.cmd, [...run.args, ...(agent.id === "cortex" ? ["connections", "list"] : ["auth", "status"])], { env, timeout: 20_000 });
     const account = agent.id === "cortex" ? cortexAccount(auth, env) : claudeAccount(auth);
     return { ...agent, found: true, path: run.cmd, args: run.args, foundAt: run.foundAt, version, env, account };
   }

@@ -137,28 +137,43 @@ async function versionedInstalls(root, exe, { readdir, isFile, platform }) {
   return out;
 }
 
-function compareVersions(a, b) {
-  const pa = String(a).replace(/^v/, "").split(/[.\-+]/);
-  const pb = String(b).replace(/^v/, "").split(/[.\-+]/);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = pa[i] ?? "";
-    const y = pb[i] ?? "";
+function parseVersion(v) {
+  const [withoutBuild, build = ""] = String(v).replace(/^v/i, "").split("+", 2);
+  const dash = withoutBuild.indexOf("-");
+  const core = dash < 0 ? withoutBuild : withoutBuild.slice(0, dash);
+  const pre = dash < 0 ? "" : withoutBuild.slice(dash + 1);
+  return { core: core.split("."), pre: pre ? pre.split(".") : [], build: build ? build.split(".") : [] };
+}
+
+function compareParts(a, b, missingZero) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? (missingZero ? "0" : "");
+    const y = b[i] ?? (missingZero ? "0" : "");
     const nx = /^\d+$/.test(x) ? Number(x) : NaN;
     const ny = /^\d+$/.test(y) ? Number(y) : NaN;
     if (!Number.isNaN(nx) && !Number.isNaN(ny)) {
       if (nx !== ny) return nx - ny;
     } else if (x !== y) {
-      // A release sorts after its pre-releases: 1.2.0 after 1.2.0-beta.
-      if (x === "") return 1;
-      if (y === "") return -1;
       return x < y ? -1 : 1;
     }
   }
   return 0;
 }
 
+function compareVersions(a, b) {
+  const va = parseVersion(a);
+  const vb = parseVersion(b);
+  const core = compareParts(va.core, vb.core, true);
+  if (core !== 0) return core;
+  // A release sorts after its pre-releases: 1.2.0 after 1.2.0-beta.
+  if (va.pre.length !== vb.pre.length && (!va.pre.length || !vb.pre.length)) return va.pre.length ? -1 : 1;
+  const pre = compareParts(va.pre, vb.pre, false);
+  if (pre !== 0) return pre;
+  return compareParts(va.build, vb.build, false);
+}
+
 // Programs a launcher script calls on the way to the real one: shells, and Node itself, which
-// `findShimTarget` handles on its own.
+// `resolveCommand` handles on its own.
 const NOT_TARGETS = new Set(["cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe", "where.exe", "node.exe", "node"]);
 const SCRIPT_EXT = /\.(c|m)?js$/i;
 
@@ -166,14 +181,16 @@ const SCRIPT_EXT = /\.(c|m)?js$/i;
 // folder and environment variables filled in.
 function shimPaths(text, shimPath, env) {
   const dir = win.dirname(shimPath);
+  const isPs1 = win.extname(shimPath).toLowerCase() === ".ps1";
+  const body = String(text).replace(isPs1 ? /^\s*#.*$/gm : /^\s*(?:@?rem(?:\s|$)|::).*$/gim, "");
   const filled = expandWindowsVars(
-    String(text)
+    body
       // cmd: %~dp0 is the script's folder with a trailing backslash; npm copies it into %dp0%.
-      .replace(/%~dp0/gi, dir + "\\")
-      .replace(/%dp0%/gi, dir + "\\")
+      .replace(/%~dp0/gi, () => dir + "\\")
+      .replace(/%dp0%/gi, () => dir + "\\")
       // PowerShell: npm's launchers set $basedir to the script's folder.
-      .replace(/\$PSScriptRoot\b/g, dir)
-      .replace(/\$basedir\b/g, dir),
+      .replace(/\$PSScriptRoot\b/gi, () => dir)
+      .replace(/\$basedir\b/gi, () => dir),
     env
   );
   const found = [];
@@ -184,11 +201,10 @@ function shimPaths(text, shimPath, env) {
     found.push(win.normalize(win.isAbsolute(s) ? s : win.join(dir, s)));
   };
   // Quoted paths may hold spaces; unquoted ones are taken up to the next space or operator.
-  const quoted = /"([^"\r\n]+)"|'([^'\r\n]+)'/g;
+  // Match both in one pass so `found` keeps the order they appear in the script.
+  const token = /"([^"\r\n]+)"|'([^'\r\n]+)'|((?:[A-Za-z]:[\\/]|\\\\|\.{1,2}[\\/])[^\s"'&|<>()]+)/g;
   let m;
-  while ((m = quoted.exec(filled))) add(m[1] || m[2]);
-  const bare = filled.replace(quoted, " ");
-  for (const t of bare.match(/(?:[A-Za-z]:[\\/]|\\\\|\.{1,2}[\\/])[^\s"'&|<>()]+/g) || []) add(t);
+  while ((m = token.exec(filled))) add(m[1] || m[2] || m[3]);
   return found;
 }
 
@@ -212,8 +228,10 @@ async function resolveCommand(file, ctx, depth = 0) {
     if (!(await ctx.isFile(target))) continue;
     if (SCRIPT_EXT.test(target)) {
       // npm's launchers use a node.exe beside them if there is one, else node from PATH.
+      // Checking the launcher's folder directly also covers .ps1 shims (`"$basedir/node$exe"`).
+      const sibling = win.join(win.dirname(file), "node.exe");
       let node = null;
-      for (const x of paths) if (!node && win.basename(x).toLowerCase() === "node.exe" && (await ctx.isFile(x))) node = x;
+      for (const x of [...paths, sibling]) if (!node && win.basename(x).toLowerCase() === "node.exe" && (await ctx.isFile(x))) node = x;
       node ||= await ctx.findNode();
       return node ? { cmd: node, args: [target] } : null;
     }

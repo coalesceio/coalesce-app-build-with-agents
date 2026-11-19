@@ -94,6 +94,8 @@ test("macOS and Linux look for the bare name, as before", async () => {
 test("Cortex Code: a cortex.cmd launcher on PATH leads to the versioned cortex.exe", async () => {
   const exe = `${LOCAL}\\cortex\\1.2.46\\cortex.exe`;
   for (const launcher of [
+    // Exact format written by https://ai.snowflake.com/static/cc-scripts/install.ps1
+    `@"${exe}" %*\r\n`,
     `@echo off\r\n"%~dp0..\\1.2.46\\cortex.exe" %*\r\n`,
     `@"%LOCALAPPDATA%\\cortex\\1.2.46\\cortex.exe" %*`,
     `@echo off\r\nset CORTEX_HOME=%LOCALAPPDATA%\\cortex\r\n%LOCALAPPDATA%\\cortex\\1.2.46\\cortex.exe %*`,
@@ -164,6 +166,41 @@ test("Claude Code from npm: the PowerShell launcher works when it's the only one
   assert.deepEqual([first.cmd, ...first.args], ["C:\\nodejs\\node.exe", `D:\\npm\\${script}`]);
 });
 
+test("Claude Code from npm: the PowerShell launcher uses a sibling node.exe and ignores variable case", async () => {
+  const script = "node_modules\\@anthropic-ai\\claude-code\\cli.js";
+  const ps1 = NPM_PS1(script).replace(/\$basedir/g, "$BaseDir");
+  const fs = fakeWindows(
+    { [`D:\\npm\\claude.ps1`]: ps1, [`D:\\npm\\${script}`]: "", "D:\\npm\\node.exe": "" },
+    { node: "C:\\nodejs\\node.exe" }
+  );
+  const [first] = await find("claude", fs, ["D:\\npm"]);
+  assert.deepEqual([first.cmd, ...first.args], ["D:\\npm\\node.exe", `D:\\npm\\${script}`]);
+});
+
+test("a launcher's quoted target wins over earlier bare paths and comments", async () => {
+  const exe = `${LOCAL}\\cortex\\1.2.46\\cortex.exe`;
+  const helper = "C:\\tools\\helper.exe";
+  const oldExe = `${LOCAL}\\cortex\\1.0.0\\cortex.exe`;
+  const cmdShim = `@echo off\r\nREM previously ${oldExe}\r\nif exist ${helper} set OK=1\r\n"${exe}" %*\r\n`;
+  const ps1Shim = `# ${oldExe}\n$path = "$psscriptroot\\..\\1.2.46\\cortex.exe"\n& $path @args\n# ${helper}\n`;
+  const fs = fakeWindows({
+    [`${LOCAL}\\cortex\\bin\\cortex.cmd`]: cmdShim,
+    [`${LOCAL}\\cortex\\bin\\cortex.ps1`]: ps1Shim,
+    [exe]: "",
+    [helper]: "",
+    [oldExe]: "",
+  });
+  assert.deepEqual(await locate.resolveCommand(`${LOCAL}\\cortex\\bin\\cortex.cmd`, fs), { cmd: exe, args: [] });
+  assert.deepEqual(await locate.resolveCommand(`${LOCAL}\\cortex\\bin\\cortex.ps1`, fs), { cmd: exe, args: [] });
+});
+
+test("a launcher in a folder whose path contains $ still expands properly", async () => {
+  const exe = "C:\\$tools\\bin\\cortex.exe";
+  const fs = fakeWindows({ "C:\\$tools\\bin\\cortex.cmd": `@"%~dp0cortex.exe" %*\r\n`, [exe]: "" });
+  const [first] = await find("cortex", fs, ["C:\\$tools\\bin"]);
+  assert.equal(first.cmd, exe);
+});
+
 test("Claude Code outside the standard place: any PATH folder, in PATH order", async () => {
   const fs = fakeWindows({ "E:\\Apps\\Claude\\claude.exe": "", [`${HOME}\\.local\\bin\\claude.exe`]: "" });
   const runs = await find("claude", fs, ["C:\\Windows\\System32", "E:\\Apps\\Claude", `${HOME}\\.local\\bin`]);
@@ -221,6 +258,6 @@ test("the usual Windows install folders are searched", () => {
 });
 
 test("versions sort as numbers", () => {
-  const sorted = ["1.10.0", "1.9.2", "v2.0.0", "1.10.0-beta.1"].sort(locate.compareVersions);
-  assert.deepEqual(sorted, ["1.9.2", "1.10.0-beta.1", "1.10.0", "v2.0.0"]);
+  const sorted = ["1.10.0", "1.9.2", "v2.0.0", "1.10.0-beta.1", "1.2", "1.2.1", "1.2.0-rc.1", "1.2.46+10", "1.2.46+2"].sort(locate.compareVersions);
+  assert.deepEqual(sorted, ["1.2.0-rc.1", "1.2", "1.2.1", "1.2.46+2", "1.2.46+10", "1.9.2", "1.10.0-beta.1", "1.10.0", "v2.0.0"]);
 });
